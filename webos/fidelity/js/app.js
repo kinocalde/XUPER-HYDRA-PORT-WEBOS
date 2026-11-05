@@ -1253,6 +1253,12 @@ function portalServiceCall(method, params, done, customTimeout) {
   }
 
   var lastBackTime = 0;
+  /* LG remotes send a keydown and a keyup for the Back button.  Handling both
+     performed the navigation twice: the keydown returned from Settings/Search
+     to Home and the matching keyup, now on Home, called platformBack() and
+     opened the TV home bar.  Skip the keyup only when its keydown was already
+     handled; models that report Back exclusively on keyup keep working. */
+  var backKeyDownPending = false;
   function back() {
     var now = Date.now();
     if (now - lastBackTime < 250) { return; }
@@ -1353,6 +1359,15 @@ function portalServiceCall(method, params, done, customTimeout) {
     }
   }
 
+  /* Visible "Inicio" control shown on Settings, Search and Detail.  It performs
+     the same navigation as Back but without depending on the remote key. */
+  function goAppHome() {
+    if (state.screen === 'search') { clearSearchState(); }
+    showScreen('home');
+    selectTab(state.tab, false);
+    if (tabEls[state.tab]) { setFocus(tabEls[state.tab]); }
+  }
+
   function activate() {
     if (!state.focus) { return; }
     if (state.focus._activate) { state.focus._activate(); }
@@ -1372,6 +1387,14 @@ function portalServiceCall(method, params, done, customTimeout) {
     /* Back buttons */
     var isBack = (k === 461 || k === 27 || k === 8 || key === 'Back' || key === 'GoBack' || key === 'Escape');
     if (isBack) {
+      var isPlatformBack = (k === 461 || key === 'Back' || key === 'GoBack');
+      if (isPlatformBack && e.type === 'keyup' && backKeyDownPending) {
+        backKeyDownPending = false;
+        if (e.preventDefault) { e.preventDefault(); }
+        if (e.stopPropagation) { e.stopPropagation(); }
+        return;
+      }
+      if (isPlatformBack && e.type === 'keydown') { backKeyDownPending = true; }
       if (state.categoryPickerOpen) {
         closeCategoryPicker();
         if (e.preventDefault) { e.preventDefault(); }
@@ -1804,6 +1827,11 @@ function portalServiceCall(method, params, done, customTimeout) {
             if (idx > 0 && tabEls[idx - 1]) {
               setFocus(tabEls[idx - 1]);
               selectTab(idx - 1, false);
+            } else if (notifyEl) {
+              /* First tab: Up opens the top notification bar instead of
+                 doing nothing. */
+              var topItem = firstIn(notifyEl);
+              if (topItem) { setFocus(topItem); }
             }
             return true;
           }
@@ -2499,6 +2527,12 @@ function portalServiceCall(method, params, done, customTimeout) {
           if (dir === 'up') {
             if (idx > 0 && liveRows[idx - 1]) {
               setFocus(liveRows[idx - 1]);
+            } else if (notifyEl) {
+              /* Top of the live list: give the notification bar (search,
+                 filter, account/settings) a way in.  It is built as
+                 focusable but the row handlers used to swallow Up here. */
+              var topItem = firstIn(notifyEl);
+              if (topItem) { setFocus(topItem); }
             }
             return true;
           }
@@ -2815,8 +2849,13 @@ function portalServiceCall(method, params, done, customTimeout) {
     return /denied|permission|not permitted|method|not exist|no existe|unknown|módulo|modulo|no carg|no disponible|no está disponible/i.test(String(error || ''));
   }
 
+  /* Shared so the About panel and the update checker cannot drift apart.
+     2.2.55 left buildAboutPanel() reading a currentVer local that only existed
+     inside checkForUpdates(), which made openSettings() throw a
+     ReferenceError while building the panel list. */
+  var APP_VERSION = '2.2.55';
   function checkForUpdates(silent, onResult) {
-    var currentVer = '2.2.55';
+    var currentVer = APP_VERSION;
 
     function paint(result) {
       if (onResult) { onResult(null, result); }
@@ -4612,7 +4651,7 @@ function portalServiceCall(method, params, done, customTimeout) {
     var updateBox = el('div', 'sp-about-update-box');
     updateBox.appendChild(el('div', 'sp-about-update-title', 'Actualizaciones de XuperTV'));
     updateBox.appendChild(el('div', 'sp-about-update-desc',
-      'Versión instalada: v' + currentVer + '. Puedes actualizar la app directamente desde tu televisor sin necesidad de usar un PC.'));
+      'Versión instalada: v' + APP_VERSION + '. Puedes actualizar la app directamente desde tu televisor sin necesidad de usar un PC.'));
     var row = el('div', 'sp-about-update-row');
     var btnCheckUpdate = el('button', 'sp-about-update-btn focusable', 'Buscar actualizaciones');
     var msgUpdate = el('span', 'sp-about-update-msg');
@@ -4628,7 +4667,7 @@ function portalServiceCall(method, params, done, customTimeout) {
           msgUpdate.textContent = '¡Nueva versión disponible: v' + res.latestVersion + '!';
           msgUpdate.style.color = '#22c55e';
         } else {
-          msgUpdate.textContent = 'Tienes la versión más reciente (v' + currentVer + ').';
+          msgUpdate.textContent = 'Tienes la versión más reciente (v' + APP_VERSION + ').';
           msgUpdate.style.color = '#38bdf8';
         }
       });
@@ -8196,10 +8235,12 @@ function portalServiceCall(method, params, done, customTimeout) {
   }
 
   /* ---------------------------------------------------------------- display */
-  /* The reference UI is authored at 1920×1080. Older sets expose that exact
-     logical viewport, whereas some UHD webOS 22/25 sets expose 3840×2160.
-     Without this fit pass only the left half of the fixed canvas is painted
-     and the right half of the TV remains black. */
+  /* The reference UI is authored at 1920×1080. appinfo.json declares a
+     1280×720 layout viewport so the window manager and the canvas agree; the
+     compositor then applies the panel devicePixelRatio (≈1.0667 on a
+     1366×768 panel) and fills the screen. Some UHD webOS 22/25 sets expose
+     3840×2160 instead. Without this fit pass only the left half of the fixed
+     canvas is painted and the right half of the TV remains black. */
   function viewportSize() {
     /* Most webOS builds report the CSS viewport here. Some 2K/4K firmware
        reports a legacy 1280×720 inner viewport while compositing to its full
@@ -8208,6 +8249,21 @@ function portalServiceCall(method, params, done, customTimeout) {
     var vw = window.innerWidth || (document.documentElement && document.documentElement.clientWidth) || 0;
     var vh = window.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 0;
     if (!vw || !vh) { vw = 1920; vh = 1080; }
+    /* Some webOS sets expose a layout viewport larger than the on-screen
+       window (e.g. a 1920×1080 canvas inside a 1280×720 window). innerWidth
+       keeps reporting the declared canvas while the compositor clips
+       everything past the real window: the viewer only sees the top-left
+       corner and the rest turns into black bars. outerWidth/outerHeight
+       report the actual window on those sets. Shrink only when the outer size
+       is smaller and keeps the same aspect ratio, so sets where the window
+       matches the viewport are never touched. */
+    var outerW = Math.floor((window.outerWidth) || 0);
+    var outerH = Math.floor((window.outerHeight) || 0);
+    if (outerW >= 640 && outerH >= 360 && outerW < vw && outerH < vh &&
+        Math.abs((outerW / outerH) - (vw / vh)) < 0.03) {
+      vw = outerW;
+      vh = outerH;
+    }
     var panelW = Math.floor((screen && screen.width) || 0);
     var panelH = Math.floor((screen && screen.height) || 0);
     var cssRatio = vw / vh;
@@ -8276,6 +8332,31 @@ function portalServiceCall(method, params, done, customTimeout) {
       setFocus(f, true);
       if (f._activate) { f._activate(); }
     });
+    var appHomeButtons = ['detail-app-home', 'search-app-home', 'settings-app-home'];
+    for (var hb = 0; hb < appHomeButtons.length; hb++) {
+      (function (homeButton) {
+        if (!homeButton) { return; }
+        homeButton._activate = goAppHome;
+        /* Down returns to the natural content of the screen instead of relying
+           on the geometric pick, which could land on an unrelated control. */
+        homeButton._onMove = function (dir) {
+          if (dir !== 'down') { return false; }
+          var target = null;
+          if (state.screen === 'settings') {
+            target = document.querySelector('.settings-item.is-selected') ||
+                     (settingsItems && settingsItems[0]);
+          } else if (state.screen === 'search') {
+            target = searchInput ||
+                     (searchHot ? firstIn(searchHot) : null) ||
+                     (searchResults ? firstIn(searchResults) : null);
+          } else if (state.screen === 'detail') {
+            target = detailPlayer || (detailButtons ? firstIn(detailButtons) : null);
+          }
+          if (target) { setFocus(target); return true; }
+          return false;
+        };
+      })($(appHomeButtons[hb]));
+    }
     try { buildSearch(); } catch (eSearch) { console.error('buildSearch error:', eSearch); }
     try {
       if (window.webOS && typeof window.webOS.deviceInfo === 'function') {
@@ -8323,6 +8404,7 @@ function portalServiceCall(method, params, done, customTimeout) {
         var n = typeof sel === 'string' ? document.querySelector(sel) : sel;
         if (n) { setFocus(n); }
       },
+      goHome: goAppHome,
       key: function (code) { handleKey({ keyCode: code, preventDefault: function () {} }); },
       search: function (q) { openSearch(); setSearchQuery(q); },
       settingsPanel: function (i) { openSettings(); showSettingsPanel(i, true); }
